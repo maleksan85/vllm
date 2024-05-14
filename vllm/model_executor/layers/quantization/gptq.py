@@ -204,21 +204,25 @@ class GPTQLinearMethod(LinearMethodBase):
         qweight = layer.qweight
         out_shape = x.shape[:-1] + (qweight.shape[-1], )
         reshaped_x = x.reshape(-1, x.shape[-1])
+
+        from vllm.model_executor.layers.quantization.h100_quantized_matmul import h100_qlinear
+        output = h100_qlinear(reshaped_x, layer.qweight, layer.qzeros, layer.scales)
+
         # exllama needs to shuffle the weight after the weight is loaded
         # here we do the shuffle on first forward pass
-        if layer.exllama_state == ExllamaState.UNINITIALIZED:
-            if self.quant_config.desc_act:
-                layer.g_idx.data = torch.argsort(layer.g_idx).to(torch.int)
-            else:
-                layer.g_idx.data = torch.empty((0, ),
-                                               device=layer.g_idx.device)
-            layer.exllama_state = ExllamaState.READY
-            ops.gptq_shuffle(layer.qweight, layer.g_idx,
-                             self.quant_config.weight_bits)
-        output = ops.gptq_gemm(reshaped_x, layer.qweight, layer.qzeros,
-                               layer.scales, layer.g_idx,
-                               layer.exllama_state == ExllamaState.READY,
-                               self.quant_config.weight_bits)
+        # if layer.exllama_state == ExllamaState.UNINITIALIZED:
+        #     if self.quant_config.desc_act:
+        #         layer.g_idx.data = torch.argsort(layer.g_idx).to(torch.int)
+        #     else:
+        #         layer.g_idx.data = torch.empty((0, ),
+        #                                        device=layer.g_idx.device)
+        #     layer.exllama_state = ExllamaState.READY
+        #     ops.gptq_shuffle(layer.qweight, layer.g_idx,
+        #                      self.quant_config.weight_bits)
+        # output = ops.gptq_gemm(reshaped_x, layer.qweight, layer.qzeros,
+        #                        layer.scales, layer.g_idx,
+        #                        layer.exllama_state == ExllamaState.READY,
+        #                        self.quant_config.weight_bits)
         if bias is not None:
             output.add_(bias)
         return output.reshape(out_shape)
