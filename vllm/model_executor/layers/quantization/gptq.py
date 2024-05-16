@@ -217,9 +217,19 @@ class GPTQLinearMethod(LinearMethodBase):
         #     ops.gptq_shuffle(layer.qweight, layer.g_idx,
         #                      self.quant_config.weight_bits)
         
-        from vllm.model_executor.layers.quantization.h100_quantized_matmul import h100_qlinear
-        output = h100_qlinear(reshaped_x, layer.qweight, layer.qzeros, layer.scales, layer.g_idx)
+        # print("========================================================================")
+        # print(f"{reshaped_x.shape=},{reshaped_x.dtype=}")
+        # print(f"{layer.qweight.shape=},{layer.qweight.dtype=}")
+        # print(f"{out_shape=}")
+        # print(f"{layer.scales.shape=},{layer.scales.dtype=}")
+        # print(f"{layer.qzeros.shape=},{layer.qzeros.dtype=}")
+        # print(f"{layer.g_idx.shape=},{layer.g_idx.dtype=}")
+        # print(f"{layer.g_idx.shape=},{layer.g_idx.dtype=}")
 
+        from vllm.model_executor.layers.quantization.gptq_quantized_matmul import gptq_qlinear
+        output = gptq_qlinear(reshaped_x, layer.qweight, 
+                              layer.qzeros, layer.scales, layer.g_idx,
+                              self.quant_config.weight_bits)
 
         # output = ops.gptq_gemm(reshaped_x, layer.qweight, layer.qzeros,
         #                        layer.scales, layer.g_idx,
