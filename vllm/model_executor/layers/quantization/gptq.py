@@ -205,9 +205,6 @@ class GPTQLinearMethod(LinearMethodBase):
         out_shape = x.shape[:-1] + (qweight.shape[-1], )
         reshaped_x = x.reshape(-1, x.shape[-1])
 
-        from vllm.model_executor.layers.quantization.h100_quantized_matmul import h100_qlinear
-        output = h100_qlinear(reshaped_x, layer.qweight, layer.qzeros, layer.scales)
-
         # exllama needs to shuffle the weight after the weight is loaded
         # here we do the shuffle on first forward pass
         # if layer.exllama_state == ExllamaState.UNINITIALIZED:
@@ -219,6 +216,11 @@ class GPTQLinearMethod(LinearMethodBase):
         #     layer.exllama_state = ExllamaState.READY
         #     ops.gptq_shuffle(layer.qweight, layer.g_idx,
         #                      self.quant_config.weight_bits)
+        
+        from vllm.model_executor.layers.quantization.h100_quantized_matmul import h100_qlinear
+        output = h100_qlinear(reshaped_x, layer.qweight, layer.qzeros, layer.scales, layer.g_idx)
+
+
         # output = ops.gptq_gemm(reshaped_x, layer.qweight, layer.qzeros,
         #                        layer.scales, layer.g_idx,
         #                        layer.exllama_state == ExllamaState.READY,
