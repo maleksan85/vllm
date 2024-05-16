@@ -7,12 +7,12 @@ import torch
         triton.Config(
             {
                 "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_N": 32,
                 "BLOCK_SIZE_K": 128,
                 "GROUP_SIZE_M": 8,
             },
             num_stages=0,
-            num_warps=2,
+            num_warps=4,
         ),
     ],
     key=["M", "N", "K"],
@@ -74,9 +74,7 @@ def _quantized_matmul(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr, idx_ptr,
         g_idx = tl.load(idx_ptrs)
 
         # Fetch scales and zeros; these are per-outfeature and thus reused in the inner loop
-        # scales = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=tl.int32) + 1
         scales = tl.load(scales_ptrs + g_idx[:, None] * stride_scales)  # (BLOCK_SIZE_K, BLOCK_SIZE_N)
-        # zeros = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=tl.int32) + 1
         zeros = tl.load(zeros_ptrs + g_idx[:, None] * stride_zeros).to(tl.uint32)  # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 
         zeros = (zeros >> zeros_shifter[None, :]) & maxq # (BLOCK_SIZE_K, BLOCK_SIZE_N)
@@ -120,7 +118,7 @@ class gptq_qlinear(torch.autograd.Function):
             scales.stride(0),
             zeros.stride(0),
             a.shape[0], b.shape[1], a.shape[1],
-            bits=bits, maxq=2**bits-1,
+            bits=bits, maxq=2**bits-1
         )
 
         return c

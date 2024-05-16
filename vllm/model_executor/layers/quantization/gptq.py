@@ -228,7 +228,7 @@ class GPTQLinearMethod(LinearMethodBase):
 
         from vllm.model_executor.layers.quantization.gptq_quantized_matmul import gptq_qlinear
         output = gptq_qlinear(reshaped_x, layer.qweight, 
-                              layer.qzeros, layer.scales, layer.g_idx,
+                              layer.scales, layer.qzeros, layer.g_idx,
                               self.quant_config.weight_bits)
 
         # output = ops.gptq_gemm(reshaped_x, layer.qweight, layer.qzeros,
