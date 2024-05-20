@@ -2,23 +2,57 @@ import triton
 import triton.language as tl
 import torch 
 
+
+
+# def autotune_config():
+#     return [
+#         triton.Config(
+#             {
+#                 "BLOCK_SIZE_M": bsm,
+#                 "BLOCK_SIZE_N": bns,
+#                 "BLOCK_SIZE_K": bnk,
+#                 "GROUP_SIZE_M": 8,
+#             },
+#             num_stages=0,
+#             num_warps=ws,
+#         )
+#         for bsm in [16, 32, 64, 128, 256]
+#         for bns in [16, 32, 64, 128, 256]
+#         for bnk in [16, 32, 64, 128, 256]
+#         for ws in [2, 4, 8, 16, 32]
+#     ]
+
+# @triton.autotune(
+#     configs=autotune_config(),
+#     key=['M', 'N', 'K'],
+# )
 @triton.autotune(
     configs=[
         triton.Config(
             {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 32,
-                "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": 8,
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 2,
             },
             num_stages=0,
-            num_warps=4,
+            num_warps=8,
         ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 4,
+            },
+            num_stages=0,
+            num_warps=8,
+        )
     ],
     key=["M", "N", "K"],
 )
 @triton.jit()
-def _quantized_matmul(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr, idx_ptr,
+def _quantized_matmul(a_ptr, b_ptr, c_ptr, d_ptr, scales_ptr, zeros_ptr, idx_ptr,
                         stride_am, stride_ak,
                         stride_bk, stride_bn,
                         stride_cm, stride_cn,
@@ -70,6 +104,9 @@ def _quantized_matmul(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr, idx_ptr,
     zeros_shifter = (offs_bn % infearure_per_bits) * bits # (BLOCK_SIZE_N)
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32) # (BLOCK_SIZE_M, BLOCK_SIZE_N)
+    if (d_ptr):
+        acc = tl.load(d_ptr + tl.arange(0, BLOCK_SIZE_M)[:, None] + tl.arange(0, BLOCK_SIZE_N))
+
     for k in range(0, total_blocks_k):
         g_idx = tl.load(idx_ptrs)
 
@@ -103,15 +140,15 @@ def _quantized_matmul(a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr, idx_ptr,
 
 class gptq_qlinear(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, a, b, scales, zeros, idx, bits):
+    def forward(ctx, a, b, d, scales, zeros, idx, bits):
         c = torch.zeros((a.shape[0], b.shape[1]), device=a.device, dtype=a.dtype)
 
         grid = lambda META: (  # noqa: E731
             triton.cdiv(c.shape[0], META["BLOCK_SIZE_M"]) * triton.cdiv(c.shape[1], META["BLOCK_SIZE_N"]),
         )
 
-        k = _quantized_matmul[grid](
-            a, b, c, scales, zeros, idx,
+        _quantized_matmul[grid](
+            a, b, c, d, scales, zeros, idx,
             a.stride(0), a.stride(1),
             b.stride(0), b.stride(1),
             c.stride(0), c.stride(1),

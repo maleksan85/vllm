@@ -227,7 +227,7 @@ class GPTQLinearMethod(LinearMethodBase):
         # print(f"{layer.g_idx.shape=},{layer.g_idx.dtype=}")
 
         from vllm.model_executor.layers.quantization.gptq_quantized_matmul import gptq_qlinear
-        output = gptq_qlinear(reshaped_x, layer.qweight, 
+        output = gptq_qlinear(reshaped_x, layer.qweight, bias,
                               layer.scales, layer.qzeros, layer.g_idx,
                               self.quant_config.weight_bits)
 
@@ -235,6 +235,6 @@ class GPTQLinearMethod(LinearMethodBase):
         #                        layer.scales, layer.g_idx,
         #                        layer.exllama_state == ExllamaState.READY,
         #                        self.quant_config.weight_bits)
-        if bias is not None:
-            output.add_(bias)
+        # if bias is not None:
+        #     output.add_(bias)
         return output.reshape(out_shape)
