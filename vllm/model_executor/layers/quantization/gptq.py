@@ -7,6 +7,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from vllm import _custom_ops as ops
+import vllm.envs as envs
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
@@ -204,18 +205,6 @@ class GPTQLinearMethod(LinearMethodBase):
         qweight = layer.qweight
         out_shape = x.shape[:-1] + (qweight.shape[-1], )
         reshaped_x = x.reshape(-1, x.shape[-1])
-
-        # exllama needs to shuffle the weight after the weight is loaded
-        # here we do the shuffle on first forward pass
-        # if layer.exllama_state == ExllamaState.UNINITIALIZED:
-        #     if self.quant_config.desc_act:
-        #         layer.g_idx.data = torch.argsort(layer.g_idx).to(torch.int)
-        #     else:
-        #         layer.g_idx.data = torch.empty((0, ),
-        #                                        device=layer.g_idx.device)
-        #     layer.exllama_state = ExllamaState.READY
-        #     ops.gptq_shuffle(layer.qweight, layer.g_idx,
-        #                      self.quant_config.weight_bits)
         
         # print("========================================================================")
         # print(f"{reshaped_x.shape=},{reshaped_x.dtype=}")
@@ -226,15 +215,28 @@ class GPTQLinearMethod(LinearMethodBase):
         # print(f"{layer.g_idx.shape=},{layer.g_idx.dtype=}")
         # print(f"{layer.g_idx.shape=},{layer.g_idx.dtype=}")
 
-        from vllm.model_executor.layers.quantization.gptq_quantized_matmul import gptq_qlinear
-        output = gptq_qlinear(reshaped_x, layer.qweight, bias,
-                              layer.scales, layer.qzeros, layer.g_idx,
-                              self.quant_config.weight_bits)
+        if envs.VLLM_USE_TRITON_GPTQ_GEMM:
+            from vllm.model_executor.layers.quantization.gptq_quantized_matmul import gptq_qlinear
+            output = gptq_qlinear(reshaped_x, layer.qweight, bias,
+                                layer.scales, layer.qzeros, layer.g_idx,
+                                self.quant_config.weight_bits)
+        else:
+            # exllama needs to shuffle the weight after the weight is loaded
+            # here we do the shuffle on first forward pass
+            if layer.exllama_state == ExllamaState.UNINITIALIZED:
+                if self.quant_config.desc_act:
+                    layer.g_idx.data = torch.argsort(layer.g_idx).to(torch.int)
+                else:
+                    layer.g_idx.data = torch.empty((0, ),
+                                                   device=layer.g_idx.device)
+                layer.exllama_state = ExllamaState.READY
+                ops.gptq_shuffle(layer.qweight, layer.g_idx,
+                                 self.quant_config.weight_bits)
+            output = ops.gptq_gemm(reshaped_x, layer.qweight, layer.qzeros,
+                                layer.scales, layer.g_idx,
+                                layer.exllama_state == ExllamaState.READY,
+                                self.quant_config.weight_bits)
+            if bias is not None:
+                output.add_(bias)
 
-        # output = ops.gptq_gemm(reshaped_x, layer.qweight, layer.qzeros,
-        #                        layer.scales, layer.g_idx,
-        #                        layer.exllama_state == ExllamaState.READY,
-        #                        self.quant_config.weight_bits)
-        # if bias is not None:
-        #     output.add_(bias)
         return output.reshape(out_shape)

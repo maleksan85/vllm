@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     VLLM_NCCL_SO_PATH: Optional[str] = None
     LD_LIBRARY_PATH: Optional[str] = None
     VLLM_USE_TRITON_FLASH_ATTN: bool = False
+    VLLM_USE_TRITON_GPTQ_GEMM: bool = False
     LOCAL_RANK: int = 0
     CUDA_VISIBLE_DEVICES: Optional[str] = None
     VLLM_ENGINE_ITERATION_TIMEOUT_S: int = 60
@@ -124,6 +125,11 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # flag to control if vllm should use triton flash attention
     "VLLM_USE_TRITON_FLASH_ATTN":
     lambda: (os.environ.get("VLLM_USE_TRITON_FLASH_ATTN", "True").lower() in
+             ("true", "1")),
+
+        # flag to control if vllm should use triton flash attention
+    "VLLM_USE_TRITON_GPTQ_GEMM":
+    lambda: (os.environ.get("VLLM_USE_TRITON_GPTQ_GEMM", "True").lower() in
              ("true", "1")),
 
     # local rank of the process in the distributed setting, used to determine

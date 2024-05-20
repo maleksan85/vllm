@@ -34,6 +34,7 @@ import torch
                 "BLOCK_SIZE_N": 64,
                 "BLOCK_SIZE_K": 64,
                 "GROUP_SIZE_M": 2,
+                "waves_per_eu": 4
             },
             num_stages=0,
             num_warps=8,
@@ -44,6 +45,7 @@ import torch
                 "BLOCK_SIZE_N": 64,
                 "BLOCK_SIZE_K": 64,
                 "GROUP_SIZE_M": 4,
+                "waves_per_eu": 4
             },
             num_stages=0,
             num_warps=8,
@@ -112,13 +114,13 @@ def _quantized_matmul(a_ptr, b_ptr, c_ptr, d_ptr, scales_ptr, zeros_ptr, idx_ptr
 
         # Fetch scales and zeros; these are per-outfeature and thus reused in the inner loop
         scales = tl.load(scales_ptrs + g_idx[:, None] * stride_scales)  # (BLOCK_SIZE_K, BLOCK_SIZE_N)
-        zeros = tl.load(zeros_ptrs + g_idx[:, None] * stride_zeros).to(tl.uint32)  # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        zeros = tl.load(zeros_ptrs + g_idx[:, None] * stride_zeros).to(tl.int32)  # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 
         zeros = (zeros >> zeros_shifter[None, :]) & maxq # (BLOCK_SIZE_K, BLOCK_SIZE_N)
         zeros = zeros + 1 # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 
         a = tl.load(a_block_ptr, boundary_check=(0,1))  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
-        b = tl.load(b_ptrs).to(tl.uint32) # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
+        b = tl.load(b_ptrs).to(tl.int32) # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
 
         b = ((b >> shifter[:, None]) & maxq).to(tl.float16) # (BLOCK_SIZE_K, BLOCK_SIZE_N)
         b = (b - zeros) * scales
