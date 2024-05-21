@@ -127,9 +127,9 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     lambda: (os.environ.get("VLLM_USE_TRITON_FLASH_ATTN", "True").lower() in
              ("true", "1")),
 
-        # flag to control if vllm should use triton flash attention
+    # flag to control if vllm should use triton GPTQ gemm
     "VLLM_USE_TRITON_GPTQ_GEMM":
-    lambda: (os.environ.get("VLLM_USE_TRITON_GPTQ_GEMM", "True").lower() in
+    lambda: (os.environ.get("VLLM_USE_TRITON_GPTQ_GEMM", "Flase").lower() in
              ("true", "1")),
 
     # local rank of the process in the distributed setting, used to determine

@@ -28,17 +28,17 @@ import torch
 # )
 @triton.autotune(
     configs=[
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 2,
-                "waves_per_eu": 4
-            },
-            num_stages=0,
-            num_warps=8,
-        ),
+        # triton.Config(
+        #     {
+        #         "BLOCK_SIZE_M": 128,
+        #         "BLOCK_SIZE_N": 64,
+        #         "BLOCK_SIZE_K": 64,
+        #         "GROUP_SIZE_M": 2,
+        #         "waves_per_eu": 4
+        #     },
+        #     num_stages=0,
+        #     num_warps=8,
+        # ),
         triton.Config(
             {
                 "BLOCK_SIZE_M": 128,
@@ -84,13 +84,12 @@ def _quantized_matmul(a_ptr, b_ptr, c_ptr, d_ptr, scales_ptr, zeros_ptr, idx_ptr
     pid_m = first_pid_m + (pid % group_size)
     pid_n = (pid % num_blocks_in_group) // (group_size)
 
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_bn = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_SIZE_N), BLOCK_SIZE_N)
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    a_block_ptr = tl.make_block_ptr(base=a_ptr, shape=(M, K), strides=(stride_am, stride_ak),
-                                offsets=(pid_m * BLOCK_SIZE_M, 0), block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
-                                order=(1,0))  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
+    a_mask = offs_am[:, None] < M
     
     # b_ptrs is set up such that it repeats elements along the K axis 8 times
     b_ptrs = b_ptr + (
@@ -105,7 +104,7 @@ def _quantized_matmul(a_ptr, b_ptr, c_ptr, d_ptr, scales_ptr, zeros_ptr, idx_ptr
     shifter = (offs_k % infearure_per_bits) * bits # (BLOCK_SIZE_K)
     zeros_shifter = (offs_bn % infearure_per_bits) * bits # (BLOCK_SIZE_N)
 
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32) # (BLOCK_SIZE_M, BLOCK_SIZE_N)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=c_ptr.dtype.element_ty) # (BLOCK_SIZE_M, BLOCK_SIZE_N)
     if (d_ptr):
         acc = tl.load(d_ptr + tl.arange(0, BLOCK_SIZE_M)[:, None] + tl.arange(0, BLOCK_SIZE_N))
 
@@ -114,24 +113,23 @@ def _quantized_matmul(a_ptr, b_ptr, c_ptr, d_ptr, scales_ptr, zeros_ptr, idx_ptr
 
         # Fetch scales and zeros; these are per-outfeature and thus reused in the inner loop
         scales = tl.load(scales_ptrs + g_idx[:, None] * stride_scales)  # (BLOCK_SIZE_K, BLOCK_SIZE_N)
-        zeros = tl.load(zeros_ptrs + g_idx[:, None] * stride_zeros).to(tl.int32)  # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        zeros = tl.load(zeros_ptrs + g_idx[:, None] * stride_zeros) # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 
         zeros = (zeros >> zeros_shifter[None, :]) & maxq # (BLOCK_SIZE_K, BLOCK_SIZE_N)
         zeros = zeros + 1 # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 
-        a = tl.load(a_block_ptr, boundary_check=(0,1))  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
-        b = tl.load(b_ptrs).to(tl.int32) # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
-
+        b = tl.load(b_ptrs) # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
         b = ((b >> shifter[:, None]) & maxq).to(tl.float16) # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+
         b = (b - zeros) * scales
 
-        acc += tl.dot(a,b) # (BLOCK_SIZE_M, BLOCK_SIZE_N)
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
+        acc += tl.dot(a, b, out_dtype=c_ptr.dtype.element_ty) # (BLOCK_SIZE_M, BLOCK_SIZE_N)
 
-        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
+        a_ptrs += BLOCK_SIZE_K
         b_ptrs += (BLOCK_SIZE_K // infearure_per_bits) * stride_bk
         idx_ptrs += BLOCK_SIZE_K
 
-    acc.to(tl.float16)
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
