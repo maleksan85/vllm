@@ -28,24 +28,24 @@ import torch
 # )
 @triton.autotune(
     configs=[
-        # triton.Config(
-        #     {
-        #         "BLOCK_SIZE_M": 128,
-        #         "BLOCK_SIZE_N": 64,
-        #         "BLOCK_SIZE_K": 64,
-        #         "GROUP_SIZE_M": 2,
-        #         "waves_per_eu": 4
-        #     },
-        #     num_stages=0,
-        #     num_warps=8,
-        # ),
         triton.Config(
             {
                 "BLOCK_SIZE_M": 128,
                 "BLOCK_SIZE_N": 64,
                 "BLOCK_SIZE_K": 64,
                 "GROUP_SIZE_M": 4,
-                "waves_per_eu": 4
+                "waves_per_eu": 6
+            },
+            num_stages=0,
+            num_warps=8,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 2,
+                "waves_per_eu": 6
             },
             num_stages=0,
             num_warps=8,
