@@ -5,6 +5,20 @@ import pytest
 
 from vllm.model_executor.layers.quantization.gptq_quantized_matmul import gptq_qlinear
 
+# export TRITON_CACHE_DIR=/root/.triton/cache
+# first_asm_file=$(find $TRITON_CACHE_DIR -name "*.amdgcn" | head -n 1)
+
+# TRITON_ALWAYS_COMPILE=1 TRITON_PRINT_AUTOTUNING=1 rocprofv2 -i /data/scripts/att.txt --plugin att $first_asm_file --mode file -d /data/profiling/gptq_triton/output python3 -m pytest -s /root/workspace/scripts/gptq_triton_benchmark.py
+
+# /data/scripts/att.txt
+# att: TARGET_CU=0
+# SE_MASK=0x0
+# SIMD_SELECT=0xF
+# ISA_CAPTURE_MODE=2
+# KERNEL=_quantized_matmul
+
+# TRITON_ALWAYS_COMPILE=1 TRITON_PRINT_AUTOTUNING=1 python3 -m pytest -s /root/workspace/scripts/gptq_triton_benchmark.py
+
 torch.manual_seed(42)
 
 warmup = 5

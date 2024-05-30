@@ -28,17 +28,17 @@ import torch
 # )
 @triton.autotune(
     configs=[
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 4,
-                "waves_per_eu": 6
-            },
-            num_stages=0,
-            num_warps=8,
-        ),
+        # triton.Config(
+        #     {
+        #         "BLOCK_SIZE_M": 128,
+        #         "BLOCK_SIZE_N": 64,
+        #         "BLOCK_SIZE_K": 64,
+        #         "GROUP_SIZE_M": 4,
+        #         "waves_per_eu": 6
+        #     },
+        #     num_stages=0,
+        #     num_warps=8,
+        # ),
         triton.Config(
             {
                 "BLOCK_SIZE_M": 128,
@@ -115,13 +115,17 @@ def _quantized_matmul(a_ptr, b_ptr, c_ptr, d_ptr, scales_ptr, zeros_ptr, idx_ptr
         scales = tl.load(scales_ptrs + g_idx[:, None] * stride_scales)  # (BLOCK_SIZE_K, BLOCK_SIZE_N)
         zeros = tl.load(zeros_ptrs + g_idx[:, None] * stride_zeros) # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 
-        zeros = (zeros >> zeros_shifter[None, :]) & maxq # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        zeros = zeros >> zeros_shifter[None, :] # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        zeros = zeros & maxq # (BLOCK_SIZE_K, BLOCK_SIZE_N)
         zeros = zeros + 1 # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 
         b = tl.load(b_ptrs) # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
-        b = ((b >> shifter[:, None]) & maxq).to(tl.float16) # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        b = b >> shifter[:, None]
+        b = b & maxq
+        b = b.to(tl.float16) # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 
-        b = (b - zeros) * scales
+        b = b - zeros
+        b = b * scales
 
         a = tl.load(a_ptrs, mask=a_mask, other=0.0)  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
         acc += tl.dot(a, b, out_dtype=c_ptr.dtype.element_ty) # (BLOCK_SIZE_M, BLOCK_SIZE_N)
