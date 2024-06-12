@@ -43,9 +43,9 @@ import torch
             {
                 "BLOCK_SIZE_M": 128,
                 "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 64,
+                "BLOCK_SIZE_K": 32,
                 "GROUP_SIZE_M": 2,
-                "waves_per_eu": 6
+                "waves_per_eu": 4
             },
             num_stages=0,
             num_warps=8,
