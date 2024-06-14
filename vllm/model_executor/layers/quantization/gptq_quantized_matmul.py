@@ -41,8 +41,8 @@ import torch
         # ),
         triton.Config(
             {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 32,
                 "BLOCK_SIZE_K": 32,
                 "GROUP_SIZE_M": 2,
                 "waves_per_eu": 4
@@ -54,7 +54,7 @@ import torch
     key=["M", "N", "K"],
 )
 @triton.jit()
-def _quantized_matmul(a_ptr, b_ptr, c_ptr, d_ptr, scales_ptr, zeros_ptr, idx_ptr,
+def _quantized_matmul(a_ptr, b_ptr, c_ptr, d_ptr, zeros_ptr, scales_ptr, idx_ptr,
                         stride_am, stride_ak,
                         stride_bk, stride_bn,
                         stride_cm, stride_cn,
@@ -104,9 +104,10 @@ def _quantized_matmul(a_ptr, b_ptr, c_ptr, d_ptr, scales_ptr, zeros_ptr, idx_ptr
     shifter = (offs_k % infearure_per_bits) * bits # (BLOCK_SIZE_K)
     zeros_shifter = (offs_bn % infearure_per_bits) * bits # (BLOCK_SIZE_N)
 
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=c_ptr.dtype.element_ty) # (BLOCK_SIZE_M, BLOCK_SIZE_N)
+    #acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=c_ptr.dtype.element_ty) # (BLOCK_SIZE_M, BLOCK_SIZE_N)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32) # (BLOCK_SIZE_M, BLOCK_SIZE_N)
     if (d_ptr):
-        acc = tl.load(d_ptr + tl.arange(0, BLOCK_SIZE_M)[:, None] + tl.arange(0, BLOCK_SIZE_N))
+        acc = tl.load(d_ptr + tl.arange(0, BLOCK_SIZE_M)[:, None] + tl.arange(0, BLOCK_SIZE_N)).to(dtype=tl.float32)
 
     for k in range(0, total_blocks_k):
         g_idx = tl.load(idx_ptrs)
@@ -128,7 +129,8 @@ def _quantized_matmul(a_ptr, b_ptr, c_ptr, d_ptr, scales_ptr, zeros_ptr, idx_ptr
         b = b * scales
 
         a = tl.load(a_ptrs, mask=a_mask, other=0.0)  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
-        acc += tl.dot(a, b, out_dtype=c_ptr.dtype.element_ty) # (BLOCK_SIZE_M, BLOCK_SIZE_N)
+        acc += tl.dot(a, b, out_dtype=tl.float32)
+        #acc += tl.dot(a, b, out_dtype=c_ptr.dtype.element_ty) # (BLOCK_SIZE_M, BLOCK_SIZE_N)
 
         a_ptrs += BLOCK_SIZE_K
         b_ptrs += (BLOCK_SIZE_K // infearure_per_bits) * stride_bk
@@ -144,7 +146,7 @@ def _quantized_matmul(a_ptr, b_ptr, c_ptr, d_ptr, scales_ptr, zeros_ptr, idx_ptr
 
 class gptq_qlinear(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, a, b, d, scales, zeros, idx, bits):
+    def forward(ctx, a, b, d, zeros, scales, idx, bits):
         c = torch.zeros((a.shape[0], b.shape[1]), device=a.device, dtype=a.dtype)
 
         grid = lambda META: (  # noqa: E731
@@ -152,7 +154,7 @@ class gptq_qlinear(torch.autograd.Function):
         )
 
         _quantized_matmul[grid](
-            a, b, c, d, scales, zeros, idx,
+            a, b, c, d, zeros, scales, idx,
             a.stride(0), a.stride(1),
             b.stride(0), b.stride(1),
             c.stride(0), c.stride(1),
@@ -165,3 +167,97 @@ class gptq_qlinear(torch.autograd.Function):
         return c
         
 gptq_qlinear = gptq_qlinear.apply
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 32,
+                "waves_per_eu": 4
+            },
+            num_stages=0,
+            num_warps=8,
+        )
+    ],
+    key=["N", "K"],
+)
+@triton.jit()
+def _dequant(b_ptr, deq_ptr, zeros_ptr, scales_ptr, idx_ptr,
+            stride_bk, stride_bn,
+            stride_scales,
+            stride_zeros,
+            N, K,
+            bits,
+            maxq, 
+            BLOCK_SIZE_N: tl.constexpr, 
+            BLOCK_SIZE_K: tl.constexpr,
+):
+    infearure_per_bits = 32 // bits
+
+    pid_k = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_bk = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    
+    # b_ptrs is set up such that it repeats elements along the K axis 8 times
+    b_ptrs = b_ptr + (
+        (offs_bk[:, None] // infearure_per_bits) * stride_bk + offs_bn[None, :] * stride_bn
+    )  # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+
+    shifter = (tl.arange(0, BLOCK_SIZE_K) % infearure_per_bits) * bits # (BLOCK_SIZE_K)
+
+    idx_ptrs = idx_ptr + offs_bk # (BLOCK_SIZE_K)
+
+    # shifter is used to extract the N bits of each element in the 32-bit word from B
+    scales_ptrs = scales_ptr + offs_bn # (BLOCK_SIZE_N)
+    zeros_ptrs = zeros_ptr + (offs_bn // infearure_per_bits) # (BLOCK_SIZE_N)
+
+    zeros_shifter = (tl.arange(0, BLOCK_SIZE_N) % infearure_per_bits) * bits # (BLOCK_SIZE_N)
+
+    g_idx = tl.load(idx_ptrs)
+
+    # Fetch scales and zeros; these are per-outfeature and thus reused in the inner loop
+    scales = tl.load(scales_ptrs + g_idx[:, None] * stride_scales)  # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+    zeros = tl.load(zeros_ptrs + g_idx[:, None] * stride_zeros) # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+
+    zeros = zeros >> zeros_shifter[None, :] # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+    zeros = zeros & maxq # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+    zeros = zeros + 1 # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+
+    b = tl.load(b_ptrs) # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
+    b = b >> shifter[:, None]
+    b = b & maxq
+    b = b.to(tl.float16) # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+
+    b = b - zeros
+    b = b * scales
+
+    deq_ptrs = deq_ptr + offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    c_mask = (offs_bk[:, None] < K) & (offs_bn[None, :] < N)
+    tl.store(deq_ptrs, b, mask=c_mask)
+
+
+class dequant_weight(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, a, b, zeros, scales, idx, bits):
+        deq_b = torch.zeros((b.shape[0] * (32 // bits), b.shape[1]), device=b.device, dtype=b.dtype)
+
+        grid = lambda META: (  # noqa: E731
+            triton.cdiv(deq_b.shape[0], META["BLOCK_SIZE_K"]), triton.cdiv(deq_b.shape[1], META["BLOCK_SIZE_N"]),
+        )
+
+        _dequant[grid](
+            b, deq_b, zeros, scales, idx,
+            b.stride(0), b.stride(1),
+            scales.stride(0),
+            zeros.stride(0),
+            b.shape[1], b.shape[1],
+            bits=bits, maxq=2**bits-1
+        )
+
+        return deq_b
+        
+dequant_weight = dequant_weight.apply
