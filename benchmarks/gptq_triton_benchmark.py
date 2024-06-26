@@ -27,15 +27,15 @@ warmup = 5
 rep = 10
 
 
-def python_gptq(a, b, d, qzeros, scales, idx, bits = 4):
+def python_dequant(a, b, d, qzeros, scales, idx, bits = 4):
     _broadcast = torch.arange(0, b.shape[0] * 8, device=b.device, dtype=b.dtype) // 8
 
     _shift = (torch.arange(0, b.shape[0] * 8, device=b.device, dtype=b.dtype) % 8) * bits
     _shift = _shift[:, None]
 
-    output = b.index_select(0, _broadcast)
-    output = (output >> _shift) & (2**bits-1)
-    output = output.to(dtype=a.dtype)
+    _b = b.index_select(0, _broadcast)
+    _b = (_b >> _shift) & (2**bits-1)
+    _b = _b.to(dtype=a.dtype)
 
     _scales = scales.index_select(0, idx)
 
@@ -45,12 +45,16 @@ def python_gptq(a, b, d, qzeros, scales, idx, bits = 4):
     _shift = torch.arange(0, 8, device=b.device, dtype=b.dtype) * bits
     _qzeros = (_qzeros >> _shift) & (2**bits-1)
     _qzeros = _qzeros.reshape(b.shape[0] * 8, b.shape[1]).to(dtype=a.dtype)
+    _qzeros = _qzeros + 1
 
-    output = (output - _qzeros - 1) * _scales
-    
+    output = (_b - _qzeros) * _scales
+
+    return output
+
+
+def python_gptq(a, b, d, qzeros, scales, idx, bits = 4):
+    output = python_dequant(a, b, d, qzeros, scales, idx, bits)
     return torch.matmul(a, output)
-
-
 
 def gptq_gemm(a, b, d, qzeros, scales, idx):
     output = ops.gptq_gemm(a, b, qzeros, scales, idx, False, 4)
@@ -59,7 +63,7 @@ def gptq_gemm(a, b, d, qzeros, scales, idx):
     return output
 
 @pytest.mark.parametrize("M, N, K, G",
-    #[ shape for shape in [(3072, 10240, 8192, 64), (3072, 8192, 28672, 224)]]
+    # [ shape for shape in [(3072, 10240, 8192, 64), (3072, 8192, 28672, 224)]]
     [ shape for shape in [(3072, 10240, 8192, 64)]]
 )
 def test_benchmark(M, N, K, G):
@@ -83,6 +87,15 @@ def test_benchmark(M, N, K, G):
         lambda: gptq_gemm(a, b, d, qzeros, scales, idx),
         warmup=warmup, rep=rep)
     print(f'SIZE: {M},{N},{K} Native RES: {res=}')
+    
+    # py_dequant = python_dequant(a, b, d, qzeros, scales, idx, 4)
+    # tr_dequant = dequant_weight(a, b, qzeros, scales, idx, 4)
+    # print("")
+    # print(f"{torch.equal(tr_dequant, py_dequant)=} error is: \
+    #         {torch.mean(torch.abs(tr_dequant - py_dequant)) / torch.mean(torch.abs(py_dequant))}")
+    # print(f"{tr_dequant=}")
+    # print(f"{py_dequant=}")
+
 
     triton_output = gptq_qlinear(a, b, d, qzeros, scales, idx, 4)
     python_output = python_gptq(a, b, d, qzeros, scales, idx)

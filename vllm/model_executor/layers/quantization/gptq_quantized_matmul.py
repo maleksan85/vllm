@@ -42,10 +42,10 @@ import torch
         triton.Config(
             {
                 "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_N": 256,
                 "BLOCK_SIZE_K": 32,
                 "GROUP_SIZE_M": 2,
-                "waves_per_eu": 4
+                "waves_per_eu": 2
             },
             num_stages=0,
             num_warps=8,
@@ -91,20 +91,18 @@ def _quantized_matmul(a_ptr, b_ptr, c_ptr, d_ptr, zeros_ptr, scales_ptr, idx_ptr
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
     a_mask = offs_am[:, None] < M
     
-    # b_ptrs is set up such that it repeats elements along the K axis 8 times
     b_ptrs = b_ptr + (
-        (offs_k[:, None] // infearure_per_bits) * stride_bk + offs_bn[None, :] * stride_bn
-    )  # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        tl.arange(0, BLOCK_SIZE_K // 8)[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    )  # (BLOCK_SIZE_K // 8, BLOCK_SIZE_N)
 
     idx_ptrs = idx_ptr + offs_k # (BLOCK_SIZE_K)
+
     # shifter is used to extract the N bits of each element in the 32-bit word from B
     scales_ptrs = scales_ptr + offs_bn # (BLOCK_SIZE_N)
-    zeros_ptrs = zeros_ptr + (offs_bn // infearure_per_bits) # (BLOCK_SIZE_N)
+    zeros_ptrs = zeros_ptr + pid_n * BLOCK_SIZE_N // 8 + tl.arange(0, BLOCK_SIZE_N // 8) # (BLOCK_SIZE_N // 8)
 
-    shifter = (offs_k % infearure_per_bits) * bits # (BLOCK_SIZE_K)
-    zeros_shifter = (offs_bn % infearure_per_bits) * bits # (BLOCK_SIZE_N)
+    shifter = tl.arange(0, 8) * bits # (BLOCK_SIZE_K)
 
-    #acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=c_ptr.dtype.element_ty) # (BLOCK_SIZE_M, BLOCK_SIZE_N)
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32) # (BLOCK_SIZE_M, BLOCK_SIZE_N)
     if (d_ptr):
         acc = tl.load(d_ptr + tl.arange(0, BLOCK_SIZE_M)[:, None] + tl.arange(0, BLOCK_SIZE_N)).to(dtype=tl.float32)
@@ -114,16 +112,24 @@ def _quantized_matmul(a_ptr, b_ptr, c_ptr, d_ptr, zeros_ptr, scales_ptr, idx_ptr
 
         # Fetch scales and zeros; these are per-outfeature and thus reused in the inner loop
         scales = tl.load(scales_ptrs + g_idx[:, None] * stride_scales)  # (BLOCK_SIZE_K, BLOCK_SIZE_N)
-        zeros = tl.load(zeros_ptrs + g_idx[:, None] * stride_zeros) # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 
-        zeros = zeros >> zeros_shifter[None, :] # (BLOCK_SIZE_K, BLOCK_SIZE_N)
-        zeros = zeros & maxq # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        zeros = tl.load(zeros_ptrs + g_idx[:, None] * stride_zeros) # (BLOCK_SIZE_K, BLOCK_SIZE_N // 8)
+        zeros = zeros[:, :, None]
+        zeros = tl.broadcast_to(zeros, (BLOCK_SIZE_K, BLOCK_SIZE_N // 8, 8))
+        zeros = zeros >> shifter[None, None, :]
+        zeros = zeros & maxq
+        zeros = zeros.to(tl.float16)
+        zeros = tl.reshape(zeros, (BLOCK_SIZE_K, BLOCK_SIZE_N))
+
         zeros = zeros + 1 # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 
-        b = tl.load(b_ptrs) # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
-        b = b >> shifter[:, None]
+        b = tl.load(b_ptrs) # (BLOCK_SIZE_K // 8, BLOCK_SIZE_N)
+        b = b[:, None, :]
+        b = tl.broadcast_to(b, (BLOCK_SIZE_K // 8, 8, BLOCK_SIZE_N))
+        b = b >> shifter[None, :, None]
         b = b & maxq
         b = b.to(tl.float16) # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        b = tl.reshape(b, (BLOCK_SIZE_K, BLOCK_SIZE_N))
 
         b = b - zeros
         b = b * scales
@@ -173,22 +179,22 @@ gptq_qlinear = gptq_qlinear.apply
     configs=[
         triton.Config(
             {
-                "BLOCK_SIZE_N": 32,
-                "BLOCK_SIZE_K": 32,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64,
                 "waves_per_eu": 4
             },
             num_stages=0,
             num_warps=8,
         )
     ],
-    key=["N", "K"],
+    key=["K", "N"],
 )
 @triton.jit()
 def _dequant(b_ptr, deq_ptr, zeros_ptr, scales_ptr, idx_ptr,
             stride_bk, stride_bn,
             stride_scales,
             stride_zeros,
-            N, K,
+            K, N,
             bits,
             maxq, 
             BLOCK_SIZE_N: tl.constexpr, 
@@ -202,48 +208,53 @@ def _dequant(b_ptr, deq_ptr, zeros_ptr, scales_ptr, idx_ptr,
     offs_bk = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     
-    # b_ptrs is set up such that it repeats elements along the K axis 8 times
-    b_ptrs = b_ptr + (
-        (offs_bk[:, None] // infearure_per_bits) * stride_bk + offs_bn[None, :] * stride_bn
-    )  # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+    offs_sq_bk = pid_k * BLOCK_SIZE_K // 8 + tl.arange(0, BLOCK_SIZE_K // 8)
+    b_ptrs = b_ptr + offs_sq_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn # (BLOCK_SIZE_K // 8, BLOCK_SIZE_N)
+    b_mask = (offs_sq_bk[:, None] < K // 8) & (offs_bn[None, :] < N)
 
-    shifter = (tl.arange(0, BLOCK_SIZE_K) % infearure_per_bits) * bits # (BLOCK_SIZE_K)
+    shifter = tl.arange(0, 8) * bits # (8)
 
     idx_ptrs = idx_ptr + offs_bk # (BLOCK_SIZE_K)
-
-    # shifter is used to extract the N bits of each element in the 32-bit word from B
     scales_ptrs = scales_ptr + offs_bn # (BLOCK_SIZE_N)
-    zeros_ptrs = zeros_ptr + (offs_bn // infearure_per_bits) # (BLOCK_SIZE_N)
 
-    zeros_shifter = (tl.arange(0, BLOCK_SIZE_N) % infearure_per_bits) * bits # (BLOCK_SIZE_N)
+    offs_sq_bn = pid_n * BLOCK_SIZE_N // 8 + tl.arange(0, BLOCK_SIZE_N // 8)
+    zeros_ptrs = zeros_ptr + offs_sq_bn # (BLOCK_SIZE_N // 8)
 
     g_idx = tl.load(idx_ptrs)
 
     # Fetch scales and zeros; these are per-outfeature and thus reused in the inner loop
     scales = tl.load(scales_ptrs + g_idx[:, None] * stride_scales)  # (BLOCK_SIZE_K, BLOCK_SIZE_N)
-    zeros = tl.load(zeros_ptrs + g_idx[:, None] * stride_zeros) # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 
-    zeros = zeros >> zeros_shifter[None, :] # (BLOCK_SIZE_K, BLOCK_SIZE_N)
-    zeros = zeros & maxq # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+    zeros = tl.load(zeros_ptrs + g_idx[:, None] * stride_zeros) # (BLOCK_SIZE_K, BLOCK_SIZE_N // 8)
+    zeros = zeros[:, :, None]
+    zeros = tl.broadcast_to(zeros, (BLOCK_SIZE_K, BLOCK_SIZE_N // 8, 8))
+    zeros = zeros >> shifter[None, None, :]
+    zeros = zeros & maxq
+    zeros = zeros.to(tl.float16)
+    zeros = tl.reshape(zeros, (BLOCK_SIZE_K, BLOCK_SIZE_N))
+
     zeros = zeros + 1 # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 
-    b = tl.load(b_ptrs) # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
-    b = b >> shifter[:, None]
+    b = tl.load(b_ptrs, mask=b_mask) # (BLOCK_SIZE_K // 8, BLOCK_SIZE_N)
+    b = b[:, None, :]
+    b = tl.broadcast_to(b, (BLOCK_SIZE_K // 8, 8, BLOCK_SIZE_N))
+    b = b >> shifter[None, :, None]
     b = b & maxq
     b = b.to(tl.float16) # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+    b = tl.reshape(b, (BLOCK_SIZE_K, BLOCK_SIZE_N))
 
     b = b - zeros
     b = b * scales
 
     deq_ptrs = deq_ptr + offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-    c_mask = (offs_bk[:, None] < K) & (offs_bn[None, :] < N)
-    tl.store(deq_ptrs, b, mask=c_mask)
+    deq_mask = (offs_bk[:, None] < K) & (offs_bn[None, :] < N)
+    tl.store(deq_ptrs, b, mask=deq_mask)
 
 
 class dequant_weight(torch.autograd.Function):
     @staticmethod
     def forward(ctx, a, b, zeros, scales, idx, bits):
-        deq_b = torch.zeros((b.shape[0] * (32 // bits), b.shape[1]), device=b.device, dtype=b.dtype)
+        deq_b = torch.zeros((b.shape[0] * (32 // bits), b.shape[1]), device=b.device, dtype=a.dtype)
 
         grid = lambda META: (  # noqa: E731
             triton.cdiv(deq_b.shape[0], META["BLOCK_SIZE_K"]), triton.cdiv(deq_b.shape[1], META["BLOCK_SIZE_N"]),
@@ -254,7 +265,7 @@ class dequant_weight(torch.autograd.Function):
             b.stride(0), b.stride(1),
             scales.stride(0),
             zeros.stride(0),
-            b.shape[1], b.shape[1],
+            deq_b.shape[0], deq_b.shape[1],
             bits=bits, maxq=2**bits-1
         )
 
