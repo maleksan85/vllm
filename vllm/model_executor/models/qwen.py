@@ -27,7 +27,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.sequence import SamplerOutput
+from vllm.sequence import IntermediateTensors, SamplerOutput
+from vllm.utils import print_warning_once
 
 
 class QWenMLP(nn.Module):
@@ -106,7 +107,8 @@ class QWenAttention(nn.Module):
         self.attn = Attention(self.num_heads,
                               self.head_dim,
                               self.scaling,
-                              cache_config=cache_config)
+                              cache_config=cache_config,
+                              quant_config=quant_config)
 
     def forward(
         self,
@@ -233,7 +235,9 @@ class QWenLMHeadModel(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.transformer = QWenModel(config, cache_config, quant_config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.lm_head = ParallelLMHead(config.vocab_size,
+                                      config.hidden_size,
+                                      quant_config=quant_config)
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = Sampler()
 
@@ -243,6 +247,7 @@ class QWenLMHeadModel(nn.Module):
         positions: torch.Tensor,
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> torch.Tensor:
         hidden_states = self.transformer(input_ids, positions, kv_caches,
                                          attn_metadata)
@@ -250,7 +255,7 @@ class QWenLMHeadModel(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor,
                        sampling_metadata: SamplingMetadata) -> torch.Tensor:
-        logits = self.logits_processor(self.lm_head.weight, hidden_states,
+        logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
         return logits
 
@@ -286,6 +291,15 @@ class QWenLMHeadModel(nn.Module):
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip loading visual weights to support Qwen-VL models
+                # in cases with text-only inputs
+                # TODO: add support for Qwen-VL
+                if (name not in params_dict
+                        and name.startswith("transformer.visual.")):
+                    print_warning_once(
+                        "Only text inputs are allowed. Images won't be handled "
+                        "until Qwen-VL models are fully supported.")
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
